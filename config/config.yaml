@@ -1,0 +1,10 @@
+
+
+
+################### DATASET CLEANING #######################
+
+## Area to filter
+## Considering pictures 1024*1024, bbox smaller then 0.1% of the area or greater then 80% of the area are not to be considered
+
+min_area: 1048.576
+max_area: 996147.2

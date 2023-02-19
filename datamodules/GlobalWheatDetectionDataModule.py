@@ -6,6 +6,7 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.utils.data as data
+import torchvision.transforms as transforms
 from skimage import io
 import torch.nn.functional as F
 
@@ -44,7 +45,7 @@ class GlobalWheatDetectionDataset(data.Dataset):
         self.pad = pad
 
     def __len__(self):
-        return len(self.landmarks_frame)
+        return self.landmarks_frame['image_id'].nunique()
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
@@ -84,25 +85,29 @@ class GlobalWheatDetectionDataset(data.Dataset):
 
 class GlobalWheatDetectionDataModule(pl.LightningDataModule):
 
-    def __init__(self, data_path):
-        self.data_path = data_path
+    def __init__(self, csv_data_path, image_root_dir, batch_size, percentage_val_dataset=0.2):
+        self.data_path = csv_data_path
+        self.image_root_dir = image_root_dir
+        self.batch_size = batch_size
 
+        transform = transforms.Compose([transforms.Resize(500, 500),
+                                        transforms.ToTensor()])
 
+        self.dataset = GlobalWheatDetectionDataset(csv_file=self.data_path,
+                                                   image_root_dir=self.image_root_dir,
+                                                   transform=transform)
 
+        train_size = (1 - percentage_val_dataset)*len(self.dataset)
+        val_size = percentage_val_dataset*len(self.dataset)
+
+        self.train_data, self.val_data = data.random_split(self.dataset,[train_size, val_size] )
 
 
     def train_dataloader(self):
-        return
+        return data.DataLoader(self.train_data, batch_size=self.batch_size, num_workers=os.cpu_count())
 
     def val_dataloader(self):
-        return
-
-
-
-
-
-
-
+        return data.DataLoader(self.val_data, batch_size=self.batch_size, num_workers=os.cpu_count())
 
 
 def main():
