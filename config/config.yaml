@@ -8,3 +8,19 @@
 
 min_area: 1048.576
 max_area: 996147.2
+
+
+## Dataset path and config
+
+train_csv_path: Datasets/global-wheat-detection/global-wheat-detection/train_cleaned.csv
+image_path: Datasets/global-wheat-detection/global-wheat-detection/train/
+log_dir: logs/
+checkpoint_path: checkpoints/
+batch_size: 1
+
+## Training params
+
+early_stopping_patience: 5
+epochs: 25
+
+restore_from_checkpoint: False
