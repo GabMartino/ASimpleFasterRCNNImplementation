@@ -24,3 +24,10 @@ early_stopping_patience: 5
 epochs: 25
 
 restore_from_checkpoint: False
+
+
+## model config
+
+
+conv_out_channels: [32, 64, 128]
+kernel_sizes: [3, 3, 3]

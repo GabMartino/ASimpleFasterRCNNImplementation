@@ -1,5 +1,7 @@
 import itertools
+from typing import List
 
+import hydra
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -10,7 +12,13 @@ from matplotlib import pyplot as plt, patches
 from matplotlib.patches import Rectangle
 from torch import ops
 from torchvision import transforms
-from torchvision.models import ResNet50_Weights
+from pybx import anchor
+from torchvision.ops import RoIPool
+
+'''
+    The Region Proposal Network has 
+
+'''
 
 class RegionProposalNet(pl.LightningModule):
     '''
@@ -18,63 +26,56 @@ class RegionProposalNet(pl.LightningModule):
         scale = [0, 1]
 
     '''
-    def __init__(self, anc_scales=[0.75, 0.5, 0.25], anc_ratios = [0.5, 1, 1.5]):
+    def __init__(self, last_feature_map_size, anc_scales=[0.75, 0.5, 0.25], anc_ratios = [0.5, 1, 1.5]):
         super().__init__()
         self.anc_scale = anc_scales
         self.anc_ratios = anc_ratios
         self.n_anc_boxes = len(anc_scales) * len(anc_ratios)  # number of anchor boxes for each anchor point
 
-    def forward(self, x):
+        self.fc_offset = nn.Sequential(nn.Conv2d(in_channels=last_feature_map_size, out_channels=1, kernel_size=1),
+                                       nn.Flatten(),
+                                       nn.LazyLinear(out_features=4),
+                                        nn.ReLU())
+
+        self.fc_box_relevance = nn.Sequential(nn.Conv2d(in_channels=last_feature_map_size, out_channels=1, kernel_size=1),
+                                       nn.Flatten(),
+                                        nn.LazyLinear(out_features=2),
+                                        nn.Softmax(dim=1))
+    def forward(self, x, image_size):
+        '''
+            Considering the input x as (Batch_size, Features_map size, H, W)
+
+            1) Create a series of region proposal that would be the same for each image in the batch
+
+        '''
+        batch_size = x.shape[0]
         features_maps_size = x.shape[-2:]
-        anchor_boxes = self.generateAnchorBoxes(features_maps_size)
+        image_sz = features_maps_size
+        feature_sz = (5, 5)
+        asp_ratio = self.anc_ratios
 
+        bboxes, _ = anchor.bxs(image_sz, feature_sz, asp_ratio) ## Create bboxes
+        #print(bboxes)
+        bboxes = [torch.Tensor(bb).expand(batch_size, -1) for bb in bboxes]
+        n_bboxes = len(bboxes)
+        print(len(bboxes))
 
+        '''
+            Input: Tensor([BATCH_SIZE, Features map, H, W]) 
+            boxes: List of Tensor, each tensor 
+        '''
+        #roi_pool_obj = RoIPool(output_size=(5, 5),spatial_scale=asp_ratio )
 
-    '''
-        Returns bboxes with shape
-        (batch_size, number of anchor boxes, 4)
-        the 4 elements are (x,y) coordidate of upperleft corner and 
-        (x,y) coordinates in the lowerright corner
-    '''
-    # @save
-    def generateAnchorBoxes(self, input_size):
-        sizes = self.anc_scale
-        ratios = self.anc_ratios
-        """Generate anchor boxes with different shapes centered on each pixel."""
-        in_height, in_width = input_size
-        device, num_sizes, num_ratios = self.device, len(sizes), len(ratios)
-        boxes_per_pixel = (num_sizes + num_ratios - 1)
-        size_tensor = torch.tensor(sizes, device=device)
-        ratio_tensor = torch.tensor(ratios, device=device)
-        # Offsets are required to move the anchor to the center of a pixel. Since
-        # a pixel has height=1 and width=1, we choose to offset our centers by 0.5
-        offset_h, offset_w = 0.5, 0.5
-        steps_h = 1.0 / in_height  # Scaled steps in y axis
-        steps_w = 1.0 / in_width  # Scaled steps in x axis
+        output = torchvision.ops.roi_pool(x, bboxes, feature_sz)
+        K = output.shape[0]
+        features_maps_dim = output.shape[1]
+        offsets = self.fc_offset(output)
+        box_relevance = self.fc_box_relevance(output)
+        print(offsets.shape, box_relevance.shape)
+        print(output.shape)
+        output = output.reshape(batch_size, int(K/batch_size), features_maps_dim, feature_sz[0], feature_sz[1])
+        print(output.shape)
 
-        # Generate all center points for the anchor boxes
-        center_h = (torch.arange(in_height, device=device) + offset_h) * steps_h
-        center_w = (torch.arange(in_width, device=device) + offset_w) * steps_w
-        shift_y, shift_x = torch.meshgrid(center_h, center_w, indexing='ij')
-        shift_y, shift_x = shift_y.reshape(-1), shift_x.reshape(-1)
-
-        # Generate `boxes_per_pixel` number of heights and widths that are later
-        # used to create anchor box corner coordinates (xmin, xmax, ymin, ymax)
-        w = torch.cat((size_tensor * torch.sqrt(ratio_tensor[0]),
-                       sizes[0] * torch.sqrt(ratio_tensor[1:]))) \
-            * in_height / in_width  # Handle rectangular inputs
-        h = torch.cat((size_tensor / torch.sqrt(ratio_tensor[0]),
-                       sizes[0] / torch.sqrt(ratio_tensor[1:])))
-        # Divide by 2 to get half height and half width
-        anchor_manipulations = torch.stack((-w, -h, w, h)).T.repeat(
-            in_height * in_width, 1) / 2
-
-        # Each center point will have `boxes_per_pixel` number of anchor boxes, so
-        # generate a grid of all anchor box centers with `boxes_per_pixel` repeats
-        out_grid = torch.stack([shift_x, shift_y, shift_x, shift_y],
-                               dim=1).repeat_interleave(boxes_per_pixel, dim=0)
-        output = out_grid + anchor_manipulations
-        return output.unsqueeze(0)
 
 '''
     This model extracts basic features from the image,
@@ -84,36 +85,60 @@ class RegionProposalNet(pl.LightningModule):
 '''
 class BackboneNetwork(pl.LightningModule):
 
-    def __init__(self):
+    def __init__(self, conv_out_channels: List,
+                 kernel_sizes: List):
         super().__init__()
-        self.back_bone = nn.Sequential(nn.Conv2d(in_channels=3, out_channels=32, kernel_size=9),
-                                       nn.MaxPool2d(kernel_size=4),
-                                       nn.BatchNorm2d(num_features=32),
-                                       nn.Conv2d(in_channels=32,out_channels=64,kernel_size=7),
-                                       nn.MaxPool2d(kernel_size=4),
-                                       nn.BatchNorm2d(num_features=64),
-                                       nn.Conv2d(in_channels=64,
-                                                 out_channels=128,
-                                                 kernel_size=3),
-                                       nn.MaxPool2d(kernel_size=4),
-                                       nn.BatchNorm2d(num_features=128)
-                                       )
+        self.conv_out_channels = conv_out_channels
+        self.kernel_sizes = kernel_sizes
+
+
+        modules = []
+        input_channels = 3
+        for map_size, k in zip(self.conv_out_channels, self.kernel_sizes):
+            modules.append(
+                nn.Sequential(nn.Conv2d(in_channels=input_channels,
+                                        out_channels=map_size,
+                                        kernel_size=k),
+                                nn.MaxPool2d(kernel_size=4),
+                                nn.BatchNorm2d(map_size)
+                              )
+
+            )
+            input_channels = map_size
+
+        self.back_bone = nn.Sequential(*modules)
+
+
     def forward(self, x):
         x = self.back_bone(x)
         return x
 
+'''
+    Faster RCNN
+    1) Backbone
+    2) RegionProposalNetwork (RPN):
+        2.1) Produces Anchorboxes
+        2.2) From each boxes produces [Offset of the boxes, box score]
+    3) 
+    
 
+'''
 
 class FasterRCNN(pl.LightningModule):
 
-    def __init__(self, lr=1e-4):
+    def __init__(self, conv_out_channels: List, kernel_sizes: List, lr=1e-4):
+        super().__init__()
         self.save_hyperparameters()
         self.learning_rate = lr
-        self.backbone = BackboneNetwork()
+        self.backbone = BackboneNetwork(conv_out_channels, kernel_sizes)
+        self.rpn = RegionProposalNet(last_feature_map_size=conv_out_channels[-1])
 
     def forward(self, x):
-
+        image_size = x.shape[-2:]
         x = self.backbone(x) ##Features maps
+        x = self.rpn(x, image_size)
+        return x
+
 
     def training_step(self, batch, batch_idx):
         pass
@@ -129,7 +154,9 @@ class FasterRCNN(pl.LightningModule):
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=self.learning_rate)
 
-
+'''
+    TESTING FUNCTIONS
+'''
 def plotAnchorPoints(anc_pts_x, anc_pts_y, width_scale_factor, height_scale_factor, img):
     anc_pts_x_proj = anc_pts_x.clone() * width_scale_factor
     anc_pts_y_proj = anc_pts_y.clone() * height_scale_factor
@@ -145,7 +172,6 @@ def plotAnchorPoints(anc_pts_x, anc_pts_y, width_scale_factor, height_scale_fact
 def plotBBoxes(bboxes, img):
 
     bboxes = bboxes.squeeze()
-    print(bboxes.shape)
     bbx = []
     for i in range(bboxes.shape[0]):
         coordinates = bboxes[i, :].squeeze()
@@ -184,40 +210,69 @@ def show_bboxes(axes, bboxes, labels=None, colors=None):
             axes.text(rect.xy[0], rect.xy[1], labels[i],
                       va='center', ha='center', fontsize=9, color=text_color,
                       bbox=dict(facecolor=color, lw=0))
+
+
+@hydra.main(version_base=None, config_path="../config", config_name="config")
+def main(cfg):
+    image = Image.open("../../Datasets/Flavia/Leaves/1006.jpg")
+    transform = transforms.Compose([transforms.ToTensor()])
+    image_tensor = transform(image)
+    #image_tensor = image_tensor[None, :, :, :]
+
+    image2 = Image.open("../../Datasets/Flavia/Leaves/1007.jpg")
+    image2_tensor = transform(image2)
+
+    batch = torch.stack([image_tensor, image2_tensor])
+    print(batch.shape)
+
+    model = FasterRCNN(cfg.conv_out_channels, cfg.kernel_sizes)
+
+    out = model(batch)
+    print(out.shape)
+
+
 def test():
-    #Get image
-    image = Image.open("./test_image.jpg")
+    '''
+        Get the image
+    '''
+    image = Image.open("../../Datasets/Flavia/Leaves/1006.jpg")
 
-    transform = transforms.Compose([
-                                    transforms.ToTensor()])
-
-    ## Transform the image in tensor
+    '''
+        Make some transformations
+    '''
+    transform = transforms.Compose([transforms.ToTensor()])
     image_tensor = transform(image)
 
     _, img_width, img_height = image_tensor.shape
 
-    ##Get features map from the image
+    '''
+        Get the features map from the image
+    '''
     back_bone = BackboneNetwork()
-    image_tensor = image_tensor[None, :, :, :]
-    out = back_bone(image_tensor)
-    out = out.squeeze()
+    image_tensor = image_tensor[None, :, :, :] ## convert in [BATCH_SIZE, NUM CHANNELS, WIDTH, HEIGHT]
+    out = back_bone(image_tensor) ## Get features map
+    out = out.squeeze() ##delete batch_size
     n_channel, f_map_width, f_map_height = out.shape
 
-    width_scale_factor = img_width // f_map_width
+    width_scale_factor = img_width // f_map_width ## get the difference of the scale between the feature map and the actual image
     height_scale_factor = img_height // f_map_height
     print(width_scale_factor, height_scale_factor)
+    '''
+        Get Anchor boxes from the RPN
+    '''
     rpn = RegionProposalNet()
 
     bboxes = rpn.generateAnchorBoxes((f_map_width, f_map_height))
-    print(bboxes.shape)
+    print("bboxes shape", bboxes.shape)
     bbox_scale = torch.tensor((width_scale_factor, height_scale_factor, width_scale_factor, height_scale_factor))
     plotBBoxes(bboxes[:, 450:456, :]*bbox_scale, img=image)
     fig = plt.imshow(image)
-    show_bboxes(fig.axes, bboxes[250, 250, :, :] * bbox_scale,
-                ['s=0.75, r=1', 's=0.5, r=1', 's=0.25, r=1', 's=0.75, r=2',
-                 's=0.75, r=0.5'])
+    #show_bboxes(fig.axes, bboxes[250, 250, :, :] * bbox_scale,
+      #          ['s=0.75, r=1', 's=0.5, r=1', 's=0.25, r=1', 's=0.75, r=2',
+      #           's=0.75, r=0.5'])
 
 
 if __name__ == "__main__":
 
-    test()
+    #test()
+    main()
